@@ -9,8 +9,16 @@ import base64
 import json
 import logging
 import random
+import socket
 import time
 import requests
+import urllib3.util.connection as urllib3_cn
+
+# Force IPv4 resolution to prevent 'Network is unreachable' on cloud VMs without IPv6 egress
+def allowed_gai_family():
+    return socket.AF_INET
+
+urllib3_cn.allowed_gai_family = allowed_gai_family
 
 logger = logging.getLogger("aihorde_client")
 
@@ -38,7 +46,7 @@ def generate_horde_image(
 ) -> bytes:
     """
     Submits a generation request to AI Horde with NSFW enabled and returns the image bytes.
-    Uses requests Session with clean browser headers to prevent Cloudflare WAF 403 blocks.
+    Uses requests Session with clean browser headers and IPv4 enforcement.
     """
     w = (min(max(width, 384), 1024) // 64) * 64
     h = (min(max(height, 384), 1024) // 64) * 64
@@ -74,18 +82,25 @@ def generate_horde_image(
         "models": POPULAR_UNCENSORED_MODELS
     }
 
-    try:
-        res = session.post(f"{HORDE_ENDPOINT}/generate/async", json=payload, timeout=20)
-        if res.status_code != 202:
-            raise RuntimeError(f"AI Horde returned status {res.status_code}: {res.text[:200]}")
+    job_id = None
+    last_err = None
+    for attempt in range(1, 4):
+        try:
+            res = session.post(f"{HORDE_ENDPOINT}/generate/async", json=payload, timeout=20)
+            if res.status_code == 202:
+                res_data = res.json()
+                job_id = res_data.get("id")
+                if job_id:
+                    logger.info(f"AI Horde job submitted successfully: {job_id}")
+                    break
+            last_err = f"Status {res.status_code}: {res.text[:150]}"
+        except Exception as e:
+            last_err = str(e)
+            logger.warning(f"AI Horde submit attempt {attempt} failed: {e}")
+        time.sleep(3)
 
-        res_data = res.json()
-        job_id = res_data.get("id")
-        if not job_id:
-            raise RuntimeError(f"AI Horde did not return a job ID: {res.text[:200]}")
-        logger.info(f"AI Horde job submitted successfully: {job_id}")
-    except Exception as e:
-        raise RuntimeError(f"Failed to submit job to AI Horde: {e}")
+    if not job_id:
+        raise RuntimeError(f"Failed to submit job to AI Horde after retries: {last_err}")
 
     # Poll for completion
     start_time = time.time()

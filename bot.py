@@ -1,8 +1,18 @@
 import logging
 import sys
+import socket
 from telebot import TeleBot
+
+# Force IPv4 resolution to prevent 'Network is unreachable' on cloud VMs without IPv6 routing
+try:
+    import urllib3.util.connection as urllib3_cn
+    urllib3_cn.allowed_gai_family = lambda: socket.AF_INET
+except Exception:
+    pass
+
 import config
 import handlers
+
 
 # Setup logging
 logging.basicConfig(
