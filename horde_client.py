@@ -48,8 +48,22 @@ def generate_horde_image(
     Submits a generation request to AI Horde with NSFW enabled and returns the image bytes.
     Uses requests Session with clean browser headers and IPv4 enforcement.
     """
-    w = (min(max(width, 384), 1024) // 64) * 64
-    h = (min(max(height, 384), 1024) // 64) * 64
+    # AI Horde anonymous limit: max 576x576 (~331,776 pixels)
+    # Scale aspect ratios safely to avoid "Due to heavy demand" 403 errors
+    if api_key and api_key != ANONYMOUS_KEY:
+        max_dim = 768
+    else:
+        max_dim = 512
+
+    aspect = width / height if height > 0 else 1.0
+    if abs(aspect - 1.0) < 0.05:
+        w, h = max_dim, max_dim
+    elif aspect > 1.0:
+        w = min(max_dim + 64, 576)
+        h = max(384, (int(w / aspect) // 64) * 64)
+    else:
+        h = min(max_dim + 64, 576)
+        w = max(384, (int(h * aspect) // 64) * 64)
 
     if seed is None:
         seed = random.randint(0, 2**31 - 1)
