@@ -8,13 +8,18 @@ from telebot import TeleBot, types
 
 import config
 import database
-from pollinations_client import generate_image
-from horde_client import generate_horde_image
+import pollinations_client
+import horde_client
+import faceswap
 
 logger = logging.getLogger("azimagegenbot.handlers")
 
-# Concurrency lock to serialize requests (Pollinations enforces 1 in-flight req per IP)
+# Concurrency lock to serialize heavy generation tasks
 generation_lock = threading.Lock()
+
+# User in-memory session states for multi-step Face Swap
+# user_states[user_id] = { "step": "awaiting_target" | "awaiting_prompt", "source_photo": bytes, "time": timestamp }
+user_states = {}
 
 def get_settings_keyboard(user_id: int) -> types.InlineKeyboardMarkup:
     """Builds inline keyboard reflecting user's current settings."""
@@ -39,7 +44,7 @@ def get_settings_keyboard(user_id: int) -> types.InlineKeyboardMarkup:
     kb.row(*engine_btns[:2])
     kb.row(engine_btns[2])
 
-    # Model buttons (for Pollinations)
+    # Model buttons
     model_buttons = []
     for model_key, label in config.AVAILABLE_MODELS.items():
         is_active = (model_key == cur_model)
@@ -94,34 +99,79 @@ def register_handlers(bot: TeleBot):
         database.add_or_update_user(user_id, username)
 
         welcome_text = (
-            f"👋 *Welcome to AI Image Generator Bot!*, {username}\n\n"
-            f"I can generate high-quality AI images **for free, with no API key and no limits!**\n\n"
-            f"🌟 *Dual-Engine Support:*\n"
-            f"• ⚡ *Pollinations*: Fast photorealistic generation (Flux, Turbo, Sana) with relaxed filters.\n"
-            f"• 🔞 *AI Horde*: 100% Uncensored / NSFW-allowed generation via decentralized GPUs.\n\n"
-            f"🚀 *How to use:*\n"
-            f"Simply **send me any text prompt** directly in this chat, e.g.:\n"
-            f"`A cybernetic samurai warrior in rain, neon glowing, 8k octane render`\n\n"
+            f"👋 *Welcome to AI Image Generator & Face Swap Bot!*, {username}\n\n"
+            f"⚡ *Features Available:*\n"
+            f"1. 🎨 *Text-to-Image*: Send any prompt to generate realistic & artistic AI images.\n"
+            f"2. 🎭 *Face Swap*: Swap any face into a target photo or generate custom scenes with your face!\n"
+            f"3. 🔞 *Dual Engine*: Fast Pollinations + Uncensored AI Horde support.\n\n"
+            f"🚀 *Quick Ways to Use:*\n"
+            f"• Send **any prompt text** to generate an image.\n"
+            f"• Send a **Photo with a Caption** (e.g. `superhero in armor`) to generate with your face!\n"
+            f"• Use `/faceswap` for step-by-step photo swapping.\n\n"
             f"⚙️ *Commands:*\n"
-            f"/engine - Choose generation engine (Auto, Pollinations, AI Horde NSFW)\n"
+            f"/faceswap - Open Face Swap Menu\n"
+            f"/engine - Choose generation engine\n"
             f"/model - Choose AI model (Flux, Turbo, Sana)\n"
-            f"/ratio - Change aspect ratio (Square, Story, Wallpaper)\n"
-            f"/settings - Configure all preferences\n"
-            f"/history - View recent generation prompts\n"
-            f"/stats - Check bot generation stats\n"
-            f"/help - Prompt writing tips & guide"
+            f"/ratio - Change aspect ratio\n"
+            f"/settings - Configure preferences\n"
+            f"/cancel - Cancel any ongoing swap\n"
+            f"/help - Complete guide"
         )
 
         kb = types.InlineKeyboardMarkup(row_width=2)
         kb.row(
-            types.InlineKeyboardButton("⚡ Choose Engine", callback_data="menu_engine"),
-            types.InlineKeyboardButton("🤖 Change Model", callback_data="menu_model")
+            types.InlineKeyboardButton("🎭 Face Swap", callback_data="menu_faceswap"),
+            types.InlineKeyboardButton("⚡ Engine", callback_data="menu_engine")
         )
         kb.row(
-            types.InlineKeyboardButton("📐 Aspect Ratio", callback_data="menu_ratio"),
-            types.InlineKeyboardButton("⚙️ Settings", callback_data="menu_settings")
+            types.InlineKeyboardButton("🤖 Model", callback_data="menu_model"),
+            types.InlineKeyboardButton("📐 Ratio", callback_data="menu_ratio")
+        )
+        kb.row(
+            types.InlineKeyboardButton("⚙️ Settings", callback_data="menu_settings"),
+            types.InlineKeyboardButton("❓ Help", callback_data="open_help")
         )
         bot.reply_to(message, welcome_text, parse_mode="Markdown", reply_markup=kb)
+
+    # -----------------------------------------------------------------------
+    # /faceswap or /swap
+    # -----------------------------------------------------------------------
+    @bot.message_handler(commands=['faceswap', 'swap'])
+    def handle_faceswap_command(message: types.Message):
+        user_id = message.from_user.id
+        # Clear previous state if any
+        if user_id in user_states:
+            del user_states[user_id]
+
+        text = (
+            f"🎭 *Face Swap Menu*\n\n"
+            f"Aap 2 alag tareeko se Face Swap kar sakte hain:\n\n"
+            f"1️⃣ *Photo-to-Photo Swap:*\n"
+            f"Apna chehra kisi doosri photo (body/dress/template) par lagayein.\n\n"
+            f"2️⃣ *Face + Prompt Generation:*\n"
+            f"Apna chehra dekar prompt likhein (jaise _in king armor_), AI nayi photo banakar aapka chehra uspar laga dega!\n\n"
+            f"👉 *Neeche diye gaye buttons me se ek chunein:*"
+        )
+
+        kb = types.InlineKeyboardMarkup(row_width=1)
+        kb.add(
+            types.InlineKeyboardButton("🖼 1. Photo-to-Photo Swap", callback_data="start_photo_swap"),
+            types.InlineKeyboardButton("✍️ 2. Face + Prompt Generation", callback_data="start_prompt_swap"),
+            types.InlineKeyboardButton("❌ Cancel", callback_data="cancel_swap")
+        )
+        bot.reply_to(message, text, parse_mode="Markdown", reply_markup=kb)
+
+    # -----------------------------------------------------------------------
+    # /cancel
+    # -----------------------------------------------------------------------
+    @bot.message_handler(commands=['cancel'])
+    def handle_cancel(message: types.Message):
+        user_id = message.from_user.id
+        if user_id in user_states:
+            del user_states[user_id]
+            bot.reply_to(message, "✅ Face swap operation cancel kar di gayi hai. Aap normal prompts bhej sakte hain.")
+        else:
+            bot.reply_to(message, "Koi active face swap operation nahi chal rahi thi.")
 
     # -----------------------------------------------------------------------
     # /help
@@ -129,18 +179,16 @@ def register_handlers(bot: TeleBot):
     @bot.message_handler(commands=['help'])
     def handle_help(message: types.Message):
         help_text = (
-            f"💡 *AI Image Bot Help & Prompting Guide*\n\n"
-            f"1. **Direct Generation**: Send any text message and the bot will generate an image.\n"
-            f"2. **Engines Available:**\n"
-            f"   • *Auto* (Default): Uses fast Pollinations, automatically falls back to AI Horde if blocked.\n"
-            f"   • *Pollinations*: Ultra-fast (10-25s), Flux/Turbo/Sana models with relaxed filters.\n"
-            f"   • *AI Horde*: 100% Uncensored, NSFW allowed via volunteer GPUs.\n\n"
-            f"3. **Aspect Ratios:**\n"
-            f"   • `1:1` - Square (1024x1024)\n"
-            f"   • `9:16` - Portrait / Mobile Wallpaper / Reel (768x1024)\n"
-            f"   • `16:9` - Landscape / Desktop Wallpaper (1024x768)\n"
-            f"   • `4:5` - Social Media Post (816x1020)\n\n"
-            f"4. **Style Keywords:** Try adding _cinematic lighting, photorealistic, 8k, cyberpunk, anime, studio portrait_ for best results!"
+            f"💡 *AI Image & Face Swap Guide*\n\n"
+            f"1. **Text to Image**: Koi bhi text prompt bhejein aur bot image generate kar dega.\n"
+            f"2. **Face Swap (2 Modes):**\n"
+            f"   • *Photo-to-Photo*: `/faceswap` choose karein -> Face Photo bhejein -> Target Photo bhejein.\n"
+            f"   • *Face + Prompt*: Face Photo bhejein aur caption me prompt likhein (jaise `in iron man suit`).\n"
+            f"3. **Engines:**\n"
+            f"   • *Auto* (Default): Fast generation with fallback.\n"
+            f"   • *Pollinations*: High speed Flux / Turbo.\n"
+            f"   • *AI Horde*: 100% Uncensored / NSFW.\n\n"
+            f"Kisi bhi waqt `/cancel` likhkar current operation cancel kar sakte hain."
         )
         bot.reply_to(message, help_text, parse_mode="Markdown")
 
@@ -243,12 +291,79 @@ def register_handlers(bot: TeleBot):
         bot.reply_to(message, text, parse_mode="Markdown")
 
     # -----------------------------------------------------------------------
-    # Direct prompt generation (/gen or any text message)
+    # Photo Message Handler (Handles Face Swapping & Face+Caption shortcuts)
+    # -----------------------------------------------------------------------
+    @bot.message_handler(content_types=['photo'])
+    def handle_photo_message(message: types.Message):
+        user_id = message.from_user.id
+        chat_id = message.chat.id
+        username = message.from_user.username or message.from_user.first_name or "User"
+        database.add_or_update_user(user_id, username)
+
+        # Download photo bytes (largest size)
+        try:
+            file_info = bot.get_file(message.photo[-1].file_id)
+            photo_bytes = bot.download_file(file_info.file_path)
+        except Exception as e:
+            bot.reply_to(message, f"❌ Photo download karne me error aaya: {e}")
+            return
+
+        state = user_states.get(user_id)
+
+        # 1. User was waiting for Target Photo (Photo-to-Photo Swap)
+        if state and state.get("step") == "awaiting_target":
+            source_bytes = state.get("source_photo")
+            del user_states[user_id]
+            process_photo_swap(bot, chat_id, user_id, source_bytes, photo_bytes, reply_to_id=message.message_id)
+            return
+
+        # 2. User has a caption on the photo -> Direct Shortcut for Face + Prompt!
+        caption = (message.caption or "").strip()
+        if caption:
+            if user_id in user_states:
+                del user_states[user_id]
+            process_face_prompt_swap(bot, chat_id, user_id, photo_bytes, caption, reply_to_id=message.message_id)
+            return
+
+        # 3. User was in awaiting_prompt mode but sent another photo
+        if state and state.get("step") == "awaiting_prompt":
+            user_states[user_id]["source_photo"] = photo_bytes
+            bot.reply_to(
+                message,
+                "📸 *New Face Photo Saved!*\n\nAb apna **Prompt text** likhkar bhejiye (e.g. `A wealthy prince in palace, 8k portrait`):",
+                parse_mode="Markdown"
+            )
+            return
+
+        # 4. Standalone photo with NO caption and NO active mode:
+        # Save as potential source photo and present interactive choice
+        user_states[user_id] = {
+            "source_photo": photo_bytes,
+            "step": "photo_received",
+            "time": time.time()
+        }
+
+        kb = types.InlineKeyboardMarkup(row_width=1)
+        kb.add(
+            types.InlineKeyboardButton("🖼 1. Doosri Photo par Lagao (Target Swap)", callback_data="state_to_target"),
+            types.InlineKeyboardButton("✍️ 2. Prompt se Scene Banao (Face + Prompt)", callback_data="state_to_prompt"),
+            types.InlineKeyboardButton("❌ Cancel", callback_data="cancel_swap")
+        )
+        bot.reply_to(
+            message,
+            "📸 *Face Photo Receive Ho Gayi!*\n\nAb aap is photo ke sath kya karna chahte hain?",
+            parse_mode="Markdown",
+            reply_markup=kb
+        )
+
+    # -----------------------------------------------------------------------
+    # Direct text prompt generation (/gen or plain text message)
     # -----------------------------------------------------------------------
     @bot.message_handler(func=lambda msg: msg.text and not msg.text.startswith('/'))
     @bot.message_handler(commands=['gen', 'generate', 'draw'])
-    def handle_prompt_message(message: types.Message):
+    def handle_text_message(message: types.Message):
         user_id = message.from_user.id
+        chat_id = message.chat.id
         username = message.from_user.username or message.from_user.first_name or "User"
         database.add_or_update_user(user_id, username)
 
@@ -262,12 +377,155 @@ def register_handlers(bot: TeleBot):
         else:
             prompt = text
 
-        process_generation(bot, message.chat.id, user_id, prompt, reply_to_message_id=message.message_id)
+        state = user_states.get(user_id)
+
+        # Check if user was in awaiting_prompt state for Face + Prompt swap
+        if state and state.get("step") == "awaiting_prompt":
+            source_bytes = state.get("source_photo")
+            del user_states[user_id]
+            process_face_prompt_swap(bot, chat_id, user_id, source_bytes, prompt, reply_to_id=message.message_id)
+            return
+
+        # Normal text-to-image generation
+        process_text_generation(bot, chat_id, user_id, prompt, reply_to_message_id=message.message_id)
 
     # -----------------------------------------------------------------------
-    # Core Image Generation Function (Dual Engine with Auto-Fallback)
+    # Core Method 1: Photo-to-Photo Face Swapping Worker
     # -----------------------------------------------------------------------
-    def process_generation(bot: TeleBot, chat_id: int, user_id: int, prompt: str, seed: int = None, reply_to_message_id: int = None):
+    def process_photo_swap(bot: TeleBot, chat_id: int, user_id: int, source_bytes: bytes, target_bytes: bytes, reply_to_id: int = None):
+        status_msg = bot.send_message(
+            chat_id,
+            "🎭 *Face Swapping in progress...*\n\nDetecting facial features and blending face into target photo...\n⏳ _1-3 seconds..._",
+            parse_mode="Markdown",
+            reply_to_message_id=reply_to_id
+        )
+
+        def worker():
+            nonlocal status_msg
+            start_t = time.time()
+            try:
+                bot.send_chat_action(chat_id, 'upload_photo')
+                swapped_bytes = faceswap.swap_face(source_bytes, target_bytes)
+                elapsed = round(time.time() - start_t, 1)
+
+                safe_name = f"faceswap_{user_id}_{int(time.time())}.jpg"
+                file_path = config.TEMP_PATH / safe_name
+                file_path.write_bytes(swapped_bytes)
+
+                caption = (
+                    f"🎭 *Face Swap Completed!*\n\n"
+                    f"✨ *Mode:* `Photo-to-Photo Swap`\n"
+                    f"⏱ *Completed in:* `{elapsed}s`"
+                )
+
+                kb = types.InlineKeyboardMarkup(row_width=2)
+                kb.row(
+                    types.InlineKeyboardButton("📁 High-Res File", callback_data=f"doc|{safe_name}"),
+                    types.InlineKeyboardButton("🎭 Swap Another", callback_data="start_photo_swap")
+                )
+
+                try:
+                    bot.delete_message(chat_id, status_msg.message_id)
+                except Exception:
+                    pass
+
+                bot.send_photo(
+                    chat_id,
+                    photo=swapped_bytes,
+                    caption=caption,
+                    parse_mode="Markdown",
+                    reply_markup=kb,
+                    reply_to_message_id=reply_to_id
+                )
+            except Exception as e:
+                logger.error(f"Face swap error: {e}", exc_info=True)
+                err_text = f"❌ *Face Swap Failed*\n\nError: `{str(e)}`\n\n💡 _Dono photos me chehra clearly visible hona chahiye._"
+                try:
+                    bot.edit_message_text(err_text, chat_id, status_msg.message_id, parse_mode="Markdown")
+                except Exception:
+                    bot.send_message(chat_id, err_text, parse_mode="Markdown")
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    # -----------------------------------------------------------------------
+    # Core Method 2: Face + Prompt Generation Worker
+    # -----------------------------------------------------------------------
+    def process_face_prompt_swap(bot: TeleBot, chat_id: int, user_id: int, source_bytes: bytes, prompt: str, reply_to_id: int = None):
+        settings = database.get_user_settings(user_id)
+        engine = settings.get("engine", config.DEFAULT_ENGINE)
+        model = settings["model"]
+        ratio = settings["ratio"]
+        ratio_info = config.AVAILABLE_RATIOS.get(ratio, {"width": 1024, "height": 1024})
+
+        status_msg = bot.send_message(
+            chat_id,
+            f"🎨 *Generating Scene with Your Face...*\n\n"
+            f"📝 *Prompt:* `{prompt[:100]}`\n"
+            f"1️⃣ Generating scene...\n"
+            f"2️⃣ Seamlessly mapping your face onto the character...\n\n"
+            f"⏳ _Please wait 15-30 seconds..._",
+            parse_mode="Markdown",
+            reply_to_message_id=reply_to_id
+        )
+
+        def worker():
+            nonlocal status_msg
+            start_t = time.time()
+            try:
+                bot.send_chat_action(chat_id, 'upload_photo')
+                swapped_bytes, orig_bytes = faceswap.swap_face_with_prompt(
+                    source_bytes=source_bytes,
+                    prompt=prompt,
+                    engine=engine,
+                    model=model,
+                    width=ratio_info["width"],
+                    height=ratio_info["height"]
+                )
+                elapsed = round(time.time() - start_t, 1)
+
+                safe_name = f"faceprompt_{user_id}_{int(time.time())}.jpg"
+                file_path = config.TEMP_PATH / safe_name
+                file_path.write_bytes(swapped_bytes)
+
+                caption = (
+                    f"✨ *Prompt:* {prompt}\n\n"
+                    f"🎭 *Mode:* `Face + Prompt Generation`\n"
+                    f"⏱ *Generated & Swapped in:* `{elapsed}s`"
+                )
+
+                kb = types.InlineKeyboardMarkup(row_width=2)
+                kb.row(
+                    types.InlineKeyboardButton("📁 High-Res File", callback_data=f"doc|{safe_name}"),
+                    types.InlineKeyboardButton("✍️ Try Another Prompt", callback_data="start_prompt_swap")
+                )
+
+                try:
+                    bot.delete_message(chat_id, status_msg.message_id)
+                except Exception:
+                    pass
+
+                bot.send_photo(
+                    chat_id,
+                    photo=swapped_bytes,
+                    caption=caption,
+                    parse_mode="Markdown",
+                    reply_markup=kb,
+                    reply_to_message_id=reply_to_id
+                )
+            except Exception as e:
+                logger.error(f"Face+Prompt swap error: {e}", exc_info=True)
+                err_text = f"❌ *Face+Prompt Generation Failed*\n\nError: `{str(e)}`"
+                try:
+                    bot.edit_message_text(err_text, chat_id, status_msg.message_id, parse_mode="Markdown")
+                except Exception:
+                    bot.send_message(chat_id, err_text, parse_mode="Markdown")
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    # -----------------------------------------------------------------------
+    # Core Method 3: Standard Text-to-Image Generation
+    # -----------------------------------------------------------------------
+    def process_text_generation(bot: TeleBot, chat_id: int, user_id: int, prompt: str, seed: int = None, reply_to_message_id: int = None):
         settings = database.get_user_settings(user_id)
         engine = settings.get("engine", config.DEFAULT_ENGINE)
         model = settings["model"]
@@ -276,7 +534,6 @@ def register_handlers(bot: TeleBot):
         width = ratio_info["width"]
         height = ratio_info["height"]
 
-        # Initial status
         engine_display = "⚡ Pollinations" if engine in ["pollinations", "auto"] else "🔞 AI Horde (Uncensored)"
         status_msg = bot.send_message(
             chat_id,
@@ -296,11 +553,10 @@ def register_handlers(bot: TeleBot):
                 used_engine = "pollinations"
                 error_msg = None
 
-                # 1. Try Pollinations first if engine is 'pollinations' or 'auto'
                 if engine in ["pollinations", "auto"]:
                     try:
                         bot.send_chat_action(chat_id, 'upload_photo')
-                        image_bytes = generate_image(
+                        image_bytes = pollinations_client.generate_image(
                             prompt=prompt,
                             model=model,
                             width=width,
@@ -312,7 +568,6 @@ def register_handlers(bot: TeleBot):
                         logger.warning(f"Pollinations attempt failed: {pe}")
                         error_msg = str(pe)
                         if engine == "auto":
-                            # Notify user that we are falling back to AI Horde
                             try:
                                 bot.edit_message_text(
                                     f"🎨 *Generating your image...*\n\n"
@@ -325,14 +580,13 @@ def register_handlers(bot: TeleBot):
                             except Exception:
                                 pass
 
-                # 2. Try AI Horde if engine is 'aihorde' or if auto-fallback needed
                 if image_bytes is None and (engine == "aihorde" or engine == "auto"):
                     try:
                         bot.send_chat_action(chat_id, 'upload_photo')
-                        image_bytes = generate_horde_image(
+                        image_bytes = horde_client.generate_horde_image(
                             prompt=prompt,
-                            width=min(width, 768),
-                            height=min(height, 768),
+                            width=width,
+                            height=height,
                             seed=seed,
                             api_key=config.AI_HORDE_KEY,
                             timeout=90
@@ -409,7 +663,7 @@ def register_handlers(bot: TeleBot):
                         f"Error: `{error_msg[:160] if error_msg else 'Unknown'}`\n\n"
                         f"💡 *Suggestions:*\n"
                         f"• Try again in 10-15 seconds.\n"
-                        f"• Switch engine via /engine (e.g. 🔞 AI Horde for uncensored prompts)."
+                        f"• Switch engine via /engine."
                     )
                     try:
                         bot.edit_message_text(fail_text, chat_id, status_msg.message_id, parse_mode="Markdown")
@@ -426,7 +680,58 @@ def register_handlers(bot: TeleBot):
         user_id = call.from_user.id
         data = call.data
 
-        if data.startswith("set_engine|"):
+        if data == "menu_faceswap":
+            bot.answer_callback_query(call.id)
+            handle_faceswap_command(call.message)
+
+        elif data == "start_photo_swap":
+            bot.answer_callback_query(call.id)
+            user_states[user_id] = {"step": "awaiting_source_for_photo_swap"}
+            bot.send_message(
+                call.message.chat.id,
+                "📸 *Step 1:* Apni **Face Photo** bhejiye (jiska chehra aap doosri photo par lagana chahte hain):",
+                parse_mode="Markdown"
+            )
+
+        elif data == "start_prompt_swap":
+            bot.answer_callback_query(call.id)
+            user_states[user_id] = {"step": "awaiting_prompt"}
+            bot.send_message(
+                call.message.chat.id,
+                "📸 *Step 1:* Apni **Face Photo** bhejiye:",
+                parse_mode="Markdown"
+            )
+
+        elif data == "state_to_target":
+            bot.answer_callback_query(call.id)
+            if user_id in user_states:
+                user_states[user_id]["step"] = "awaiting_target"
+                bot.send_message(
+                    call.message.chat.id,
+                    "🎯 *Step 2:* Ab wo **Target Photo** bhejiye jiski body/dress par ye chehra lagana hai:",
+                    parse_mode="Markdown"
+                )
+
+        elif data == "state_to_prompt":
+            bot.answer_callback_query(call.id)
+            if user_id in user_states:
+                user_states[user_id]["step"] = "awaiting_prompt"
+                bot.send_message(
+                    call.message.chat.id,
+                    "✍️ *Step 2:* Ab apna **Prompt text** likhkar bhejiye (e.g. `A wealthy prince in gold palace, 8k portrait`):",
+                    parse_mode="Markdown"
+                )
+
+        elif data == "cancel_swap":
+            bot.answer_callback_query(call.id, "Cancelled")
+            if user_id in user_states:
+                del user_states[user_id]
+            try:
+                bot.edit_message_text("❌ Operation cancel ho gayi hai.", call.message.chat.id, call.message.message_id)
+            except Exception:
+                bot.send_message(call.message.chat.id, "❌ Operation cancel ho gayi hai.")
+
+        elif data.startswith("set_engine|"):
             engine = data.split("|")[1]
             database.set_user_engine(user_id, engine)
             bot.answer_callback_query(call.id, f"Engine set to {engine.upper()}!")
@@ -519,17 +824,6 @@ def register_handlers(bot: TeleBot):
                 ))
             bot.send_message(call.message.chat.id, "📐 *Select your preferred Aspect Ratio:*", parse_mode="Markdown", reply_markup=kb)
 
-        elif data == "menu_stats":
-            bot.answer_callback_query(call.id)
-            stats = database.get_global_stats()
-            text = (
-                f"📊 *Bot Generation Statistics*\n\n"
-                f"👥 *Total Users:* {stats['total_users']}\n"
-                f"✅ *Successful Generations:* {stats['total_success']}\n"
-                f"⚠️ *Failed Requests:* {stats['total_failed']}\n"
-            )
-            bot.send_message(call.message.chat.id, text, parse_mode="Markdown")
-
         elif data == "open_help":
             bot.answer_callback_query(call.id)
             handle_help(call.message)
@@ -579,6 +873,6 @@ def register_handlers(bot: TeleBot):
                     prompt = history[0]["prompt"]
 
             if prompt:
-                process_generation(bot, call.message.chat.id, user_id, prompt)
+                process_text_generation(bot, call.message.chat.id, user_id, prompt)
             else:
                 bot.send_message(call.message.chat.id, "⚠️ Could not find prompt to regenerate. Please send the prompt again.")
