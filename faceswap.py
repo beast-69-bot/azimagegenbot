@@ -46,6 +46,36 @@ def get_swapper():
     return _swapper
 
 
+def detect_faces_with_fallback(app: FaceAnalysis, img: np.ndarray):
+    """
+    Detects faces in an image with progressive sensitivity fallback:
+    1. Standard threshold (0.3)
+    2. Sensitive threshold (0.15)
+    3. Ultra-sensitive threshold (0.08)
+    """
+    faces = app.get(img)
+    if faces:
+        return faces
+
+    # Fallback to lower detection thresholds for stylized or angled faces
+    det_model = app.models.get('detection')
+    orig_thresh = getattr(det_model, 'det_thresh', 0.3) if det_model else 0.3
+
+    for fallback_thresh in [0.15, 0.08]:
+        try:
+            if det_model:
+                det_model.det_thresh = fallback_thresh
+            faces = app.get(img)
+            if faces:
+                logger.info(f"Face detected with fallback threshold: {fallback_thresh}")
+                return faces
+        finally:
+            if det_model:
+                det_model.det_thresh = orig_thresh
+
+    return []
+
+
 def swap_face(source_bytes: bytes, target_bytes: bytes) -> bytes:
     """
     Swaps face from source image onto target image.
@@ -64,7 +94,7 @@ def swap_face(source_bytes: bytes, target_bytes: bytes) -> bytes:
         raise ValueError("Target image invalid ya corrupt hai.")
 
     # Detect faces in source
-    source_faces = app.get(source_img)
+    source_faces = detect_faces_with_fallback(app, source_img)
     if not source_faces:
         raise ValueError("Source photo me koi saaf chehra detect nahi hua! Kripya kisi aisi photo bhejein jisme chehra saaf dikh raha ho.")
 
@@ -76,7 +106,7 @@ def swap_face(source_bytes: bytes, target_bytes: bytes) -> bytes:
     )[0]
 
     # Detect faces in target
-    target_faces = app.get(target_img)
+    target_faces = detect_faces_with_fallback(app, target_img)
     if not target_faces:
         raise ValueError("Target photo me koi chehra detect nahi hua! Kripya target photo me aisi picture bhejein jisme insaan ka chehra visible ho.")
 
@@ -98,6 +128,41 @@ def swap_face(source_bytes: bytes, target_bytes: bytes) -> bytes:
     return encoded.tobytes()
 
 
+def clean_and_enhance_prompt(prompt: str, is_female: bool) -> str:
+    """
+    Normalizes conversational commands like 'put dress on her body' into descriptive
+    portrait prompts that ensure the AI generates a clear human face and body.
+    """
+    import re
+    p = prompt.strip()
+
+    # Normalize command phrases like 'put dress on her body', 'wear saree', etc.
+    replacements = [
+        (r"^(put|give|add|wear)\s+(a\s+|an\s+)?", "wearing a "),
+        (r"\s+on\s+(her|his|my|the)\s+body", ""),
+        (r"\s+on\s+(her|him|me)", ""),
+        (r"^make\s+(her|him)\s+", ""),
+        (r"^change\s+(her|his)\s+clothes\s+to\s+", "wearing "),
+    ]
+    for pattern, repl in replacements:
+        p = re.sub(pattern, repl, p, flags=re.IGNORECASE).strip()
+
+    subject = "beautiful woman" if is_female else "handsome man"
+
+    # Check if a human subject is already mentioned
+    has_person = any(w in p.lower() for w in ["woman", "girl", "lady", "female", "man", "guy", "boy", "male", "person", "character", "king", "queen", "prince", "princess", "warrior", "model", "superhero"])
+
+    if has_person:
+        enhanced = f"portrait photo of {p}, clear detailed visible human face looking directly at camera, sharp focus, 8k resolution, cinematic lighting"
+    else:
+        # e.g. "wearing a dress" -> "portrait photo of a beautiful woman wearing a dress, clear detailed visible human face..."
+        if not p.lower().startswith("in ") and not p.lower().startswith("wearing "):
+            p = f"wearing {p}"
+        enhanced = f"portrait photo of a {subject} {p}, clear detailed visible human face looking directly at camera, sharp focus, 8k resolution, cinematic lighting"
+
+    return enhanced
+
+
 def swap_face_with_prompt(
     source_bytes: bytes,
     prompt: str,
@@ -107,21 +172,33 @@ def swap_face_with_prompt(
     height: int = 1024
 ) -> tuple[bytes, bytes]:
     """
-    1. Generates an image scene matching the prompt.
-    2. Swaps user's face onto the generated scene.
+    1. Detects source face and gender.
+    2. Rewrites/enhances the prompt to guarantee a visible human portrait.
+    3. Generates the scene using AI.
+    4. Swaps user's face onto the generated scene.
     Returns tuple: (swapped_image_bytes, original_generated_bytes)
     """
-    # Verify source face first so we don't waste generation time if face isn't detectable
     app = get_face_analyzer()
     source_img = cv2.imdecode(np.frombuffer(source_bytes, np.uint8), cv2.IMREAD_COLOR)
     if source_img is None:
         raise ValueError("Source photo invalid hai.")
-    source_faces = app.get(source_img)
+
+    source_faces = detect_faces_with_fallback(app, source_img)
     if not source_faces:
         raise ValueError("Aapki photo me koi saaf chehra detect nahi hua! Kripya ek achhi lighting aur clear face wali photo bhejein.")
 
-    # Append prompt enhancement to ensure a clear human face is generated in the scene
-    enhanced_prompt = f"{prompt}, close up portrait photo, clear detailed visible human face looking at camera, 8k masterpiece"
+    source_face = sorted(
+        source_faces,
+        key=lambda x: (x.bbox[2] - x.bbox[0]) * (x.bbox[3] - x.bbox[1]),
+        reverse=True
+    )[0]
+
+    # Detect gender from source face (0 = female, 1 = male)
+    is_female = (getattr(source_face, 'gender', 1) == 0)
+
+    # Intelligently rewrite prompt to guarantee face visibility
+    enhanced_prompt = clean_and_enhance_prompt(prompt, is_female)
+    logger.info(f"Enhanced prompt for face swap: '{enhanced_prompt}' (gender: {'female' if is_female else 'male'})")
 
     generated_bytes = None
     if engine in ["pollinations", "auto"]:
@@ -146,5 +223,17 @@ def swap_face_with_prompt(
         raise RuntimeError("Prompt se background image generate nahi ho payi. Kripya prompt badal kar try karein.")
 
     # Swap face onto generated image
-    swapped_bytes = swap_face(source_bytes, generated_bytes)
+    try:
+        swapped_bytes = swap_face(source_bytes, generated_bytes)
+    except ValueError as ve:
+        if "Target photo me koi chehra detect nahi hua" in str(ve):
+            raise ValueError(
+                "AI dwara banayi gayi photo me chehra detect nahi hua (AI ne sirf dress/body generate ki).\n\n"
+                "💡 Tip: Prompt ko is tarah likhein jisme insaan bhi shamil ho:\n"
+                "• 'beautiful woman wearing stylish red dress'\n"
+                "• 'gorgeous lady in traditional saree'\n"
+                "• 'handsome man in royal tuxedo'"
+            )
+        raise ve
+
     return swapped_bytes, generated_bytes
