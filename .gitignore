@@ -1,0 +1,13 @@
+.env
+*.db
+*.sqlite3
+*.log
+logs/
+temp/
+downloads/
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+ENV/
