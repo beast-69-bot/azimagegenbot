@@ -52,6 +52,7 @@ def generate_image(prompt: str,
         "height": str(height),
         "seed":   str(seed),
         "nologo": "true" if nologo else "false",
+        "safe":   "false",
     }
     url = ENDPOINT + "/" + urllib.parse.quote(prompt, safe="")
     url += "?" + urllib.parse.urlencode(params)

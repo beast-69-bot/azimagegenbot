@@ -31,6 +31,17 @@ AVAILABLE_RATIOS = {
 }
 DEFAULT_RATIO = "1:1"
 
+# Supported Engines (Pollinations, AI Horde Uncensored, Auto-Fallback)
+AVAILABLE_ENGINES = {
+    "auto": "⚡ Auto (Fast Pollinations + Uncensored Horde Fallback)",
+    "pollinations": "🎨 Pollinations (Flux / Turbo / Sana)",
+    "aihorde": "🔞 AI Horde (100% Uncensored / NSFW Allowed)"
+}
+DEFAULT_ENGINE = "auto"
+
+# AI Horde Key (Anonymous 0000000000 by default, free & no account needed)
+AI_HORDE_KEY = os.getenv("AI_HORDE_KEY", "0000000000").strip()
+
 # Directories
 TEMP_PATH = BASE_DIR / "temp"
 LOGS_PATH = BASE_DIR / "logs"
@@ -40,3 +51,4 @@ LOGS_PATH.mkdir(parents=True, exist_ok=True)
 
 # Logging Level
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+

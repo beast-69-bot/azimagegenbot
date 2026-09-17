@@ -18,6 +18,7 @@ def init_db():
     CREATE TABLE IF NOT EXISTS users (
         id INTEGER PRIMARY KEY,
         username TEXT,
+        engine TEXT DEFAULT 'auto',
         model TEXT DEFAULT 'flux',
         ratio TEXT DEFAULT '1:1',
         joined TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -25,12 +26,19 @@ def init_db():
     )
     """)
     
+    # Safe migration in case table already exists
+    try:
+        cursor.execute("ALTER TABLE users ADD COLUMN engine TEXT DEFAULT 'auto'")
+    except Exception:
+        pass
+
     # History table
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS history (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id INTEGER,
         prompt TEXT,
+        engine TEXT DEFAULT 'pollinations',
         model TEXT,
         width INTEGER,
         height INTEGER,
@@ -41,6 +49,10 @@ def init_db():
         FOREIGN KEY (user_id) REFERENCES users(id)
     )
     """)
+    try:
+        cursor.execute("ALTER TABLE history ADD COLUMN engine TEXT DEFAULT 'pollinations'")
+    except Exception:
+        pass
     
     conn.commit()
     conn.close()
@@ -61,19 +73,28 @@ def add_or_update_user(user_id: int, username: str):
 def get_user_settings(user_id: int) -> dict:
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT model, ratio FROM users WHERE id = ?", (user_id,))
+    cursor.execute("SELECT engine, model, ratio FROM users WHERE id = ?", (user_id,))
     row = cursor.fetchone()
     conn.close()
     
     if row:
         return {
+            "engine": row["engine"] or config.DEFAULT_ENGINE,
             "model": row["model"] or config.DEFAULT_MODEL,
             "ratio": row["ratio"] or config.DEFAULT_RATIO
         }
     return {
+        "engine": config.DEFAULT_ENGINE,
         "model": config.DEFAULT_MODEL,
         "ratio": config.DEFAULT_RATIO
     }
+
+def set_user_engine(user_id: int, engine: str):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("UPDATE users SET engine = ? WHERE id = ?", (engine, user_id))
+    conn.commit()
+    conn.close()
 
 def set_user_model(user_id: int, model: str):
     conn = get_db_connection()
@@ -88,6 +109,7 @@ def set_user_ratio(user_id: int, ratio: str):
     cursor.execute("UPDATE users SET ratio = ? WHERE id = ?", (ratio, user_id))
     conn.commit()
     conn.close()
+
 
 def log_generation(user_id: int, prompt: str, model: str, width: int, height: int, seed: int, size: int, status: str):
     conn = get_db_connection()
